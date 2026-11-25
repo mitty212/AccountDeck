@@ -2,7 +2,7 @@
 
 A portable Windows x64 multi-account browser with a Rust host and an embedded HTML interface. It uses the installed Microsoft Edge WebView2 runtime. No installer, administrator access, account subscription, or activation key is used.
 
-[Download for Windows](https://github.com/mitty212/AccountDeck/releases/latest) · [Validation](qa/VALIDATION.md) · [MIT license](LICENSE)
+[Download Windows EXE](https://github.com/mitty212/AccountDeck/raw/refs/heads/main/downloads/AccountDeck.exe) · [Portable ZIP](https://github.com/mitty212/AccountDeck/raw/refs/heads/main/downloads/AccountDeck-portable.zip) · [Source ZIP](https://github.com/mitty212/AccountDeck/raw/refs/heads/main/downloads/AccountDeck-source.zip) · [Validation](qa/VALIDATION.md) · [MIT license](LICENSE)
 
 ![AccountDeck workspace](docs/screenshot.png)
 

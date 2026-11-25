@@ -15,3 +15,5 @@ instance.lock
 *.tmp
 *.exe
 *.zip
+!/downloads/*.exe
+!/downloads/*.zip
