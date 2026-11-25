@@ -1,0 +1,17 @@
+/target/
+/AccountDeck-data/
+/qa/output/
+/qa/results/
+/qa/ui-workspace/
+/qa/__pycache__/
+/qa/pe-verification.json
+/qa/shell-preview.png
+*.dpapi
+accounts.json
+instance.lock
+.env
+.env.*
+*.log
+*.tmp
+*.exe
+*.zip

@@ -1,0 +1,24 @@
+[package]
+name = "accountdeck"
+version = "0.1.0"
+edition = "2024"
+description = "Portable, isolated multi-account browser for Windows"
+license = "MIT"
+
+[dependencies]
+wry = { version = "=0.57.3", features = ["devtools"] }
+tao = "0.37"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+url = "2"
+argon2 = { version = "0.5", features = ["std"] }
+directories = "6"
+rfd = "0.15"
+webview2-com = "0.39"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Com", "Win32_System_Threading", "Win32_Security_Cryptography"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
