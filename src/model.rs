@@ -4,7 +4,7 @@ use argon2::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -106,6 +106,28 @@ impl Account {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedTab {
+    pub id: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DownloadSettings {
+    #[serde(default)]
+    pub directory: Option<PathBuf>,
+    #[serde(default = "default_true")]
+    pub ask_where_to_save: bool,
+}
+impl Default for DownloadSettings {
+    fn default() -> Self {
+        Self {
+            directory: None,
+            ask_where_to_save: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
     pub accounts: Vec<Account>,
@@ -115,6 +137,14 @@ pub struct Settings {
     pub theme: String,
     #[serde(default)]
     pub password_hash: Option<String>,
+    #[serde(default)]
+    pub downloads: DownloadSettings,
+    #[serde(default)]
+    pub open_tabs: HashMap<String, Vec<SavedTab>>,
+    #[serde(default)]
+    pub active_tabs: HashMap<String, String>,
+    #[serde(default)]
+    pub sidebar_collapsed: bool,
 }
 
 impl Default for Settings {
@@ -124,6 +154,10 @@ impl Default for Settings {
             active: None,
             theme: default_theme(),
             password_hash: None,
+            downloads: DownloadSettings::default(),
+            open_tabs: HashMap::new(),
+            active_tabs: HashMap::new(),
+            sidebar_collapsed: false,
         }
     }
 }
@@ -173,6 +207,34 @@ impl Settings {
         }
         if !matches!(self.theme.as_str(), "dark" | "light") {
             self.theme = default_theme();
+        }
+        if self
+            .downloads
+            .directory
+            .as_ref()
+            .is_some_and(|p| !p.is_absolute())
+        {
+            return Err("Download folder must be an absolute path.".into());
+        }
+        self.open_tabs.retain(|id, _| ids.contains(id));
+        self.active_tabs.retain(|id, _| ids.contains(id));
+        let mut tab_ids = HashSet::new();
+        for tabs in self.open_tabs.values_mut() {
+            if tabs.len() > 500 {
+                return Err("Too many tabs in one profile.".into());
+            }
+            for tab in tabs {
+                tab.id = Uuid::parse_str(&tab.id)
+                    .map_err(|_| "Invalid tab ID.")?
+                    .hyphenated()
+                    .to_string();
+                if !tab_ids.insert(tab.id.clone()) {
+                    return Err("Duplicate tab ID.".into());
+                }
+                if tab.url != "about:blank" {
+                    tab.url = normalize_url(&tab.url)?;
+                }
+            }
         }
         if let Some(hash) = &self.password_hash {
             let parsed =
@@ -346,6 +408,43 @@ mod tests {
         Account::new("Test account", "example.com", "Work", "#31c7af").unwrap()
     }
 
+    #[test]
+    fn older_settings_keep_profiles_and_get_safe_new_defaults() {
+        let old = serde_json::json!({"accounts":[sample()],"theme":"light"});
+        let path =
+            std::env::temp_dir().join(format!("accountdeck-migration-{}.json", Uuid::new_v4()));
+        fs::write(&path, old.to_string()).unwrap();
+        let loaded = Settings::load(&path).unwrap();
+        fs::remove_file(path).unwrap();
+        assert_eq!(loaded.accounts.len(), 1);
+        assert_eq!(loaded.theme, "light");
+        assert!(loaded.downloads.ask_where_to_save);
+        assert!(loaded.open_tabs.is_empty());
+        assert!(!loaded.sidebar_collapsed);
+    }
+    #[test]
+    fn tab_layout_and_download_preferences_survive_settings_reload() {
+        let a = sample();
+        let id = a.id.clone();
+        let t = SavedTab {
+            id: Uuid::new_v4().to_string(),
+            url: "https://example.com/inbox".into(),
+        };
+        let mut s = Settings::default();
+        s.accounts.push(a);
+        s.open_tabs.insert(id.clone(), vec![t.clone()]);
+        s.active_tabs.insert(id.clone(), t.id.clone());
+        s.sidebar_collapsed = true;
+        s.downloads.ask_where_to_save = false;
+        s.downloads.directory = Some(std::env::temp_dir());
+        let path = std::env::temp_dir().join(format!("accountdeck-tabs-{}.json", Uuid::new_v4()));
+        s.save(&path).unwrap();
+        let result = Settings::load(&path).unwrap();
+        fs::remove_file(path).unwrap();
+        assert_eq!(result.open_tabs[&id][0].id, t.id);
+        assert!(result.sidebar_collapsed);
+        assert!(!result.downloads.ask_where_to_save);
+    }
     #[test]
     fn url_normalization_rejects_executable_and_local_addresses() {
         assert_eq!(

@@ -22,7 +22,7 @@ try{
  const call=(method,params={})=>new Promise((r,j)=>{const id=++seq;pending.set(id,{r,j});ws.send(JSON.stringify({id,method,params}));setTimeout(()=>{if(pending.delete(id))j(Error('Debugger command timeout: '+method));},10000).unref();});
  const evaluate=async expression=>{const r=await call('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});if(r.exceptionDetails)throw Error(r.exceptionDetails.text);return r.result.value;};
  const wait=async expression=>{for(let i=0;i<100;i++){if(await evaluate(expression))return;await delay(100);}throw Error('State condition timed out: '+expression);};
- await wait('typeof window.receiveState === "function" && state.version === "0.1.0"');
+ await wait('typeof window.receiveState === "function" && state.version === "0.2.0"');
  await call('Page.enable');
  let shot=await call('Page.captureScreenshot',{format:'png'});await writeFile(path.join(output,'native-empty.png'),Buffer.from(shot.data,'base64'));
  await evaluate('document.getElementById("addAccount").click()');
