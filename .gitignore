@@ -1,5 +1,6 @@
 /target/
 /AccountDeck-data/
+**/AccountDeck-data/
 /qa/output/
 /qa/results/
 /qa/ui-workspace/

@@ -9,6 +9,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
 };
+use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
 const MAX_CONFIG_BYTES: usize = 4 * 1024 * 1024;
@@ -35,6 +36,8 @@ pub struct Account {
     #[serde(default)]
     pub name: String,
     #[serde(default)]
+    pub abbreviation: String,
+    #[serde(default)]
     pub url: String,
     #[serde(default)]
     pub group: String,
@@ -57,6 +60,7 @@ impl Account {
         let mut account = Self {
             id: Uuid::new_v4().to_string(),
             name: name.into(),
+            abbreviation: String::new(),
             url: url.into(),
             group: group.into(),
             color: if color.is_empty() {
@@ -81,6 +85,12 @@ impl Account {
             .hyphenated()
             .to_string();
         self.name = self.name.trim().to_string();
+        self.abbreviation = self.abbreviation.trim().to_string();
+        if self.abbreviation.graphemes(true).count() > 3
+            || self.abbreviation.chars().any(char::is_control)
+        {
+            return Err("Profile abbreviation must contain at most 3 characters.".into());
+        }
         self.group = self.group.trim().to_string();
         if self.name.is_empty() || self.name.chars().count() > 100 {
             return Err("Account name must contain between 1 and 100 characters.".into());
@@ -109,6 +119,39 @@ impl Account {
 pub struct SavedTab {
     pub id: String,
     pub url: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ServicePreset {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+}
+impl ServicePreset {
+    pub fn new(name: &str, url: &str) -> Result<Self, String> {
+        let mut s = Self {
+            id: Uuid::new_v4().to_string(),
+            name: name.into(),
+            url: url.into(),
+        };
+        s.validate()?;
+        Ok(s)
+    }
+    fn validate(&mut self) -> Result<(), String> {
+        self.id = Uuid::parse_str(&self.id)
+            .map_err(|_| "Invalid saved service ID.")?
+            .hyphenated()
+            .to_string();
+        self.name = self.name.trim().to_string();
+        if self.name.is_empty()
+            || self.name.chars().count() > 60
+            || self.name.chars().any(char::is_control)
+        {
+            return Err("Service name must contain 1–60 characters.".into());
+        }
+        self.url = normalize_url(&self.url)?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -145,6 +188,10 @@ pub struct Settings {
     pub active_tabs: HashMap<String, String>,
     #[serde(default)]
     pub sidebar_collapsed: bool,
+    #[serde(default)]
+    pub top_compact: bool,
+    #[serde(default)]
+    pub custom_services: Vec<ServicePreset>,
 }
 
 impl Default for Settings {
@@ -158,6 +205,8 @@ impl Default for Settings {
             open_tabs: HashMap::new(),
             active_tabs: HashMap::new(),
             sidebar_collapsed: false,
+            top_compact: false,
+            custom_services: Vec::new(),
         }
     }
 }
@@ -196,6 +245,16 @@ impl Settings {
             return Err("Too many accounts in settings.".into());
         }
         let mut ids = HashSet::new();
+        if self.custom_services.len() > 1000 {
+            return Err("Too many saved services.".into());
+        }
+        let mut service_ids = HashSet::new();
+        for service in &mut self.custom_services {
+            service.validate()?;
+            if !service_ids.insert(service.id.clone()) {
+                return Err("Duplicate saved service ID.".into());
+            }
+        }
         for account in &mut self.accounts {
             account.validate()?;
             if !ids.insert(account.id.clone()) {
@@ -299,6 +358,31 @@ impl Settings {
             .hash_password(value.as_bytes(), &salt)
             .map_err(|error| format!("Cannot protect password: {error}"))?;
         self.password_hash = Some(hash.to_string());
+        Ok(())
+    }
+
+    /// Drop within/between visible navigation sections, preserving all profile storage IDs.
+    pub fn move_profile(&mut self, id: &str, target: &str, after: bool) -> Result<(), String> {
+        if id == target {
+            return Ok(());
+        }
+        let from = self
+            .accounts
+            .iter()
+            .position(|a| a.id == id)
+            .ok_or("Profile was not found.")?;
+        let destination = self
+            .accounts
+            .iter()
+            .find(|a| a.id == target)
+            .ok_or("Drop target was not found.")?;
+        let group = destination.group.clone();
+        let pinned = destination.pinned;
+        let mut account = self.accounts.remove(from);
+        account.group = group;
+        account.pinned = pinned;
+        let index = self.accounts.iter().position(|a| a.id == target).unwrap() + usize::from(after);
+        self.accounts.insert(index, account);
         Ok(())
     }
 
@@ -445,6 +529,73 @@ mod tests {
         assert!(result.sidebar_collapsed);
         assert!(!result.downloads.ask_where_to_save);
     }
+    #[test]
+    fn abbreviations_count_display_characters_and_old_profiles_default_empty() {
+        let mut a = sample();
+        for value in ["FB1", "a\u{301}b👩‍💻", ""] {
+            a.abbreviation = value.into();
+            a.validate().unwrap();
+        }
+        a.abbreviation = "ABCD".into();
+        assert!(a.validate().is_err());
+        a.abbreviation = "A\nB".into();
+        assert!(a.validate().is_err());
+        let mut old = serde_json::to_value(sample()).unwrap();
+        old.as_object_mut().unwrap().remove("abbreviation");
+        let loaded: Account = serde_json::from_value(old).unwrap();
+        assert_eq!(loaded.abbreviation, "");
+    }
+    #[test]
+    fn services_and_compact_top_survive_reload_with_safe_old_defaults() {
+        let service = ServicePreset::new("  Local Chat  ", "example.com/chat").unwrap();
+        assert_eq!(service.name, "Local Chat");
+        assert_eq!(service.url, "https://example.com/chat");
+        assert!(ServicePreset::new("", "example.com").is_err());
+        assert!(ServicePreset::new("Bad", "javascript:alert(1)").is_err());
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!old.top_compact);
+        assert!(old.custom_services.is_empty());
+        let s = Settings {
+            top_compact: true,
+            custom_services: vec![service],
+            ..Settings::default()
+        };
+        let mut loaded: Settings =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        loaded.validate().unwrap();
+        assert!(loaded.top_compact);
+        assert_eq!(loaded.custom_services[0].id, s.custom_services[0].id);
+    }
+    #[test]
+    fn moving_profiles_preserves_identity_and_joins_drop_target_group() {
+        let mut a = sample();
+        a.abbreviation = "ABC".into();
+        a.muted = true;
+        let b = sample();
+        let mut c = sample();
+        c.group = "Other".into();
+        c.pinned = true;
+        let ids = [a.id.clone(), b.id.clone(), c.id.clone()];
+        let mut s = Settings {
+            accounts: vec![a, b, c],
+            ..Settings::default()
+        };
+        s.move_profile(&ids[0], &ids[1], true).unwrap();
+        assert_eq!(
+            s.accounts.iter().map(|a| a.id.clone()).collect::<Vec<_>>(),
+            vec![ids[1].clone(), ids[0].clone(), ids[2].clone()]
+        );
+        assert_eq!(s.accounts[1].abbreviation, "ABC");
+        assert!(s.accounts[1].muted);
+        s.move_profile(&ids[0], &ids[2], true).unwrap();
+        assert_eq!(s.accounts[2].id, ids[0]);
+        assert_eq!(s.accounts[2].group, "Other");
+        assert!(s.accounts[2].pinned);
+        let before = serde_json::to_string(&s).unwrap();
+        assert!(s.move_profile(&ids[0], "missing", false).is_err());
+        assert_eq!(before, serde_json::to_string(&s).unwrap());
+    }
+
     #[test]
     fn url_normalization_rejects_executable_and_local_addresses() {
         assert_eq!(

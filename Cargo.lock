@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "accountdeck"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "argon2",
  "directories",
@@ -12,6 +12,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tao",
+ "unicode-segmentation",
  "url",
  "uuid",
  "webview2-com",

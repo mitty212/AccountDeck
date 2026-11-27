@@ -20,7 +20,7 @@ async function mouse(c,selector,click=false){const p=await c.eval(`(()=>{const r
 async function launch(){const env={...process.env,ACCOUNTDECK_QA_CDP_BASE:String(base)};delete env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS;child=spawn(path.join(root,'target/release/accountdeck.exe'),['--data-dir',workspace],{windowsHide:true,env,stdio:'ignore'});return connect(base,t=>t.title==='AccountDeck');}
 const checks=[];
 try{
- let shell=await launch();await wait(shell,'state.version==="0.2.0"');
+ let shell=await launch();await wait(shell,'state.version==="0.3.0"');
  const ids=[];for(const name of ['Source','Target','Excluded']){await shell.eval(`send({op:'add',name:${JSON.stringify(name)},url:${JSON.stringify(origin+'/fixture?profile='+name)},group:'QA',color:'#347d73'})`);await wait(shell,'state.accounts.length==='+ (ids.length+1));ids.push(await shell.eval('state.active'));}
  const pages=[];observed=pages;for(const id of ids){const c=await connect(port(id),t=>t.url.startsWith(origin+'/fixture'));await wait(c,'typeof identity==="string"');pages.push(c);}
  assert.notEqual(await pages[0].eval('identity'),await pages[1].eval('identity'));

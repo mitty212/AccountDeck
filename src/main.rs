@@ -38,8 +38,20 @@ enum AppEvent {
         origin: String,
         body: String,
     },
+    SyncResult {
+        tab: String,
+        epoch: u64,
+        result: Result<(), String>,
+    },
     CloseTab(String),
+    DownloadProgress {
+        id: String,
+        received: u64,
+        total: Option<u64>,
+        status: String,
+    },
     Download {
+        id: String,
         args: ICoreWebView2DownloadStartingEventArgs,
         deferral: ICoreWebView2Deferral,
     },
@@ -76,11 +88,17 @@ struct App {
     overlay: bool,
     sync_selection: sync::Selection,
     sync_epoch: Arc<AtomicU64>,
+    sync_ready: bool,
+    sync_feedback: HashMap<String, Value>,
+    sync_dirty: bool,
     snapshotting: snapshot_queue::SnapshotQueue,
     closing: Option<Instant>,
     sleeping: HashSet<String>,
     last_snapshot: Instant,
     last_unlock: Option<Instant>,
+    download_items: Vec<download::Record>,
+    download_dirty: bool,
+    last_download_ui: Instant,
     _shell_context: WebContext,
     _instance_lock: File,
 }
@@ -93,6 +111,17 @@ impl App {
             72.
         } else {
             260.
+        }
+    }
+    fn top(&self) -> f64 {
+        if self.settings.top_compact { 48. } else { 128. }
+    }
+    fn resize_views(&self) {
+        let bounds = browser::bounds(&self.window, self.width(), self.top());
+        for b in self.browsers.values() {
+            for t in &b.tabs {
+                let _ = t.view.set_bounds(bounds);
+            }
         }
     }
     fn save(&mut self) -> Result<(), String> {
@@ -144,7 +173,7 @@ impl App {
             })
             .unwrap_or_default();
         let candidates=self.browsers.iter().flat_map(|(id,b)|b.tabs.iter().map(move|t|json!({"id":t.id,"profile":id,"name":self.settings.accounts.iter().find(|a|&a.id==id).map(|a|&a.name),"title":t.title,"url":t.url}))).collect::<Vec<_>>();
-        let state = json!({"accounts":self.settings.accounts,"active":self.settings.active,"theme":self.settings.theme,"locked":self.locked,"has_password":self.settings.password_hash.is_some(),"version":env!("CARGO_PKG_VERSION"),"data_path":self.directory,"loaded":self.browsers.keys().collect::<Vec<_>>(),"current_url":tab.map(|t|&t.url),"current_title":tab.map(|t|&t.title),"tabs":tabs,"active_tab":browser.map(|b|&b.active_tab),"sync":self.sync_selection,"sync_candidates":candidates,"sidebar_collapsed":self.settings.sidebar_collapsed,"downloads":{"directory":self.settings.downloads.directory.clone().unwrap_or_else(download::default_directory),"ask_where_to_save":self.settings.downloads.ask_where_to_save}});
+        let state = json!({"accounts":self.settings.accounts,"active":self.settings.active,"theme":self.settings.theme,"locked":self.locked,"has_password":self.settings.password_hash.is_some(),"version":env!("CARGO_PKG_VERSION"),"data_path":self.directory,"loaded":self.browsers.keys().collect::<Vec<_>>(),"current_url":tab.map(|t|&t.url),"current_title":tab.map(|t|&t.title),"tabs":tabs,"active_tab":browser.map(|b|&b.active_tab),"sync":self.sync_selection,"sync_candidates":candidates,"sync_ready":self.sync_ready,"sync_feedback":self.sync_feedback,"sidebar_collapsed":self.settings.sidebar_collapsed,"top_compact":self.settings.top_compact,"custom_services":self.settings.custom_services,"download_items":self.download_items,"downloads":{"directory":self.settings.downloads.directory.clone().unwrap_or_else(download::default_directory),"ask_where_to_save":self.settings.downloads.ask_where_to_save}});
         let _ = self
             .shell
             .evaluate_script(&format!("window.receiveState({state})"));
@@ -158,6 +187,12 @@ impl App {
                         && self.settings.active.as_ref() == Some(id)
                         && tab.id == b.active_tab,
                 );
+                // Hidden target controllers must continue rendering to acknowledge native input.
+                if !self.locked && !self.overlay && self.sync_selection.targets.contains(&tab.id) {
+                    unsafe {
+                        let _ = tab.view.controller().SetIsVisible(true);
+                    }
+                }
             }
         }
     }
@@ -170,6 +205,9 @@ impl App {
     fn stop_sync(&mut self) {
         self.sync_epoch.fetch_add(1, Ordering::Relaxed);
         self.sync_selection = sync::Selection::default();
+        self.sync_ready = false;
+        self.sync_feedback.clear();
+        self.visibility();
         self.refresh_sync();
     }
     fn refresh_sync(&self) {
@@ -181,6 +219,7 @@ impl App {
                         && !self.overlay
                         && self.closing.is_none()
                         && self.sync_selection.source.as_ref() == Some(&t.id),
+                    self.sync_selection.include_passwords,
                 );
             }
         }
@@ -201,6 +240,7 @@ impl App {
             .ok_or("Profile was not found.")?
             .clone();
         let width = self.width();
+        let top = self.top();
         let b = self.browsers.get_mut(&profile).unwrap();
         if b.tabs.len() == 1 {
             b.add_tab(
@@ -209,6 +249,7 @@ impl App {
                 "about:blank",
                 self.proxy.clone(),
                 width,
+                top,
                 None,
             )?;
         }
@@ -222,7 +263,7 @@ impl App {
         self.send_state();
         Ok(())
     }
-    fn sync_input(&self, id: &str, origin: &str, body: &str) {
+    fn sync_input(&mut self, id: &str, origin: &str, body: &str) {
         if self.locked
             || self.overlay
             || self.closing.is_some()
@@ -247,33 +288,55 @@ impl App {
             return;
         };
         if packet.token != source.sync_token
-            || sync::page_key(origin) != sync::page_key(&packet.page)
+            || !sync::same_origin(origin, &packet.page)
             || !sync::same_origin(&source.url, origin)
             || !sync::valid(&packet.action)
         {
+            return;
+        }
+        if let sync::Action::Ready { enabled } = packet.action {
+            self.sync_ready = enabled;
+            self.sync_dirty = true;
             return;
         }
         let key = sync::page_key(&packet.page);
         if key.is_none() {
             return;
         }
+        let epoch = self.sync_epoch.load(Ordering::Relaxed);
         for target in &self.sync_selection.targets {
+            let p = self.proxy.clone();
+            let id = target.clone();
+            let report = std::rc::Rc::new(move |result| {
+                let _ = p.send_event(AppEvent::SyncResult {
+                    tab: id.clone(),
+                    epoch,
+                    result,
+                });
+            });
             if let Some(tab) = self.tab(target) {
-                if sync::page_key(&tab.url) == key {
-                    let _ = sync::replay(
-                        &tab.view,
-                        packet.action.clone(),
-                        tab.sync_queue.clone(),
-                        self.sync_epoch.clone(),
-                        self.sync_epoch.load(Ordering::Relaxed),
-                        packet.page.clone(),
-                    );
+                if sync::page_key(&tab.url) != key {
+                    report(Err("Target is on a different page.".into()));
+                    continue;
+                }
+                if let Err(e) = sync::replay(
+                    &tab.view,
+                    packet.action.clone(),
+                    tab.sync_queue.clone(),
+                    self.sync_epoch.clone(),
+                    epoch,
+                    packet.page.clone(),
+                    self.sync_selection.include_passwords,
+                    report.clone(),
+                ) {
+                    report(Err(e));
                 }
             }
         }
     }
     fn download(
         &mut self,
+        id: String,
         args: ICoreWebView2DownloadStartingEventArgs,
         deferral: ICoreWebView2Deferral,
     ) -> Result<(), String> {
@@ -290,6 +353,14 @@ impl App {
                     .map_err(|e| e.to_string())?;
             }
             let name = download::filename(&webview2_com::take_pwstr(suggested));
+            self.download_items.push(download::Record {
+                id: id.clone(),
+                name: name.clone(),
+                received: 0,
+                total: None,
+                status: "waiting".into(),
+            });
+            self.send_state();
             let directory = self
                 .settings
                 .downloads
@@ -306,16 +377,30 @@ impl App {
             };
             unsafe {
                 if let Some(path) = path {
+                    if let Some(item) = self.download_items.iter_mut().find(|i| i.id == id) {
+                        item.name = path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into();
+                        item.status = "downloading".into();
+                    }
                     args.SetResultFilePath(&HSTRING::from(path.as_os_str()))
                         .map_err(|e| e.to_string())?;
                     args.SetHandled(true).map_err(|e| e.to_string())?;
                 } else {
+                    if let Some(item) = self.download_items.iter_mut().find(|i| i.id == id) {
+                        item.status = "canceled".into();
+                    }
                     args.SetCancel(true).map_err(|e| e.to_string())?;
                 }
             }
             Ok(())
         })();
         if result.is_err() {
+            if let Some(item) = self.download_items.iter_mut().find(|i| i.id == id) {
+                item.status = "failed".into();
+            }
             unsafe {
                 let _ = args.SetCancel(true);
             }
@@ -323,6 +408,7 @@ impl App {
         unsafe {
             deferral.Complete().map_err(|e| e.to_string())?;
         }
+        self.download_dirty = true;
         result
     }
     fn activate(&mut self, id: &str) -> Result<(), String> {
@@ -351,6 +437,7 @@ impl App {
                     .unwrap_or(&[]),
                 self.settings.active_tabs.get(id).map(String::as_str),
                 self.width(),
+                self.top(),
             )?;
             self.browsers.insert(id.into(), b);
         }
@@ -493,7 +580,9 @@ impl App {
                 self.refresh_sync();
             }
             "add" => {
-                let a = Account::new(s("name"), s("url"), s("group"), s("color"))?;
+                let mut a = Account::new(s("name"), s("url"), s("group"), s("color"))?;
+                a.abbreviation = s("abbreviation").into();
+                a.validate()?;
                 let id = a.id.clone();
                 self.settings.accounts.push(a);
                 self.save()?;
@@ -508,6 +597,9 @@ impl App {
                     .ok_or("Account was not found.")?;
                 let mut a = self.settings.accounts[index].clone();
                 a.name = s("name").into();
+                if let Some(abbr) = v["abbreviation"].as_str() {
+                    a.abbreviation = abbr.into();
+                }
                 a.url = s("url").into();
                 a.group = s("group").into();
                 a.color = s("color").into();
@@ -613,6 +705,33 @@ impl App {
                     }
                 }
             }
+            "profile_move" => {
+                self.settings
+                    .move_profile(s("id"), s("target"), s("position") == "after")?
+            }
+            "top_compact" => {
+                self.settings.top_compact =
+                    v["value"].as_bool().unwrap_or(!self.settings.top_compact);
+                self.resize_views();
+            }
+            "service_save" => {
+                let mut service = model::ServicePreset::new(s("name"), s("url"))?;
+                if !s("id").is_empty() {
+                    let index = self
+                        .settings
+                        .custom_services
+                        .iter()
+                        .position(|p| p.id == s("id"))
+                        .ok_or("Saved service was not found.")?;
+                    service.id = s("id").into();
+                    self.settings.custom_services[index] = service;
+                } else {
+                    if self.settings.custom_services.len() >= 1000 {
+                        return Err("Too many saved services.".into());
+                    }
+                    self.settings.custom_services.push(service);
+                }
+            }
             "tab_new" => {
                 self.stop_sync();
                 let profile = self
@@ -628,6 +747,7 @@ impl App {
                     .unwrap()
                     .clone();
                 let width = self.width();
+                let top = self.top();
                 let url = if s("url").is_empty() {
                     a.url.clone()
                 } else {
@@ -636,7 +756,7 @@ impl App {
                 self.browsers
                     .get_mut(&profile)
                     .ok_or("Profile is asleep.")?
-                    .add_tab(&self.window, &a, &url, self.proxy.clone(), width, None)?;
+                    .add_tab(&self.window, &a, &url, self.proxy.clone(), width, top, None)?;
                 self.visibility();
             }
             "tab_activate" => {
@@ -658,7 +778,7 @@ impl App {
                 self.settings.sidebar_collapsed = v["collapsed"]
                     .as_bool()
                     .unwrap_or(!self.settings.sidebar_collapsed);
-                let bounds = browser::bounds(&self.window, self.width());
+                let bounds = browser::bounds(&self.window, self.width(), self.top());
                 for b in self.browsers.values() {
                     for t in &b.tabs {
                         let _ = t.view.set_bounds(bounds);
@@ -724,7 +844,9 @@ impl App {
                 self.sync_selection = sync::Selection {
                     source: Some(source),
                     targets: targets.into_iter().collect(),
+                    include_passwords: v["include_passwords"].as_bool().unwrap_or(false),
                 };
+                self.visibility();
                 self.refresh_sync();
             }
             "navigate" => {
@@ -846,6 +968,7 @@ impl App {
                 .ok_or("Profile was not found.")?
                 .clone();
             let width = self.width();
+            let top = self.top();
             let b = self.browsers.get_mut(&id).ok_or("Profile is asleep.")?;
             let previous_tab = b.active_tab.clone();
             let tab = b.add_tab(
@@ -854,6 +977,7 @@ impl App {
                 "about:blank",
                 self.proxy.clone(),
                 width,
+                top,
                 Some(environment),
             )?;
             unsafe {
@@ -1034,11 +1158,17 @@ fn run() -> Result<(), String> {
         overlay: false,
         sync_selection: sync::Selection::default(),
         sync_epoch: Arc::new(AtomicU64::new(0)),
+        sync_ready: false,
+        sync_feedback: HashMap::new(),
+        sync_dirty: false,
         snapshotting: snapshot_queue::SnapshotQueue::default(),
         closing: None,
         sleeping: HashSet::new(),
         last_snapshot: Instant::now(),
         last_unlock: None,
+        download_items: Vec::new(),
+        download_dirty: false,
+        last_download_ui: Instant::now(),
         _shell_context: context,
         _instance_lock: instance,
     };
@@ -1072,7 +1202,7 @@ fn run() -> Result<(), String> {
                 ..
             } if window_id == app.window.id() => {
                 for b in app.browsers.values() {
-                    for tab in &b.tabs{let _ = tab.view.set_bounds(browser::bounds(&app.window,app.width()));}
+                    for tab in &b.tabs{let _ = tab.view.set_bounds(browser::bounds(&app.window,app.width(),app.top()));}
                 }
             }
             Event::UserEvent(AppEvent::Command(body)) => {
@@ -1086,8 +1216,18 @@ fn run() -> Result<(), String> {
                 app.refresh_sync();app.send_state();
             },
             Event::UserEvent(AppEvent::SyncInput{tab,origin,body})=>app.sync_input(&tab,&origin,&body),
+            Event::UserEvent(AppEvent::SyncResult{tab,epoch,result})=>{
+                if app.sync_epoch.load(Ordering::Relaxed)==epoch {
+                    let value=match result{Ok(())=>json!({"status":"synced"}),Err(reason)=>json!({"status":"skipped","reason":reason})};
+                    if app.sync_feedback.get(&tab)!=Some(&value){app.sync_feedback.insert(tab,value);app.sync_dirty=true;}
+                }
+            },
             Event::UserEvent(AppEvent::CloseTab(id))=>{if let Err(e)=app.close_tab(&id){app.error(&e);}},
-            Event::UserEvent(AppEvent::Download{args,deferral})=>{if let Err(e)=app.download(args,deferral){app.error(&e);}},
+            Event::UserEvent(AppEvent::Download{id,args,deferral})=>{if let Err(e)=app.download(id,args,deferral){app.error(&e);}},
+            Event::UserEvent(AppEvent::DownloadProgress{id,received,total,status})=>{
+                if let Some(item)=app.download_items.iter_mut().find(|i|i.id==id){item.received=received;item.total=total;if !matches!(item.status.as_str(),"canceled"|"failed"){item.status=status;}}
+                app.download_dirty=true;
+            },
             Event::UserEvent(AppEvent::DownloadFinished{path,success})=>{let message=if success{format!("Download saved: {}",path.map(|p|p.display().to_string()).unwrap_or_default())}else{"Download canceled or interrupted.".into()};let _=app.shell.evaluate_script(&format!("window.showNotice?.({})",serde_json::to_string(&message).unwrap()));},
             Event::UserEvent(AppEvent::SnapshotDone { id, result }) => {
                 app.finish_snapshot(id,result);
@@ -1103,6 +1243,9 @@ fn run() -> Result<(), String> {
                 }
             }
             _ => {}
+        }
+        if (app.download_dirty||app.sync_dirty)&&app.last_download_ui.elapsed()>=Duration::from_millis(150){
+            app.send_state();app.download_dirty=false;app.sync_dirty=false;app.last_download_ui=Instant::now();
         }
         if let Some(start) = app.closing {
             if app.snapshotting.is_empty() {

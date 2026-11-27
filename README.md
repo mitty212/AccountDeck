@@ -20,15 +20,23 @@ On systems without WebView2, install Microsoft's Evergreen WebView2 runtime usin
 
 ## Sessions and account controls
 
-### Tabs and sidebar
+### Profiles, tabs, and pane controls
+
+Set **Icon abbreviation** in account settings to show up to three characters on its icon. Leave it empty to use initials. Drag a profile above or below another profile to reorder the left navigation bar. Dropping into another group or the pinned section joins that section; profile IDs and login storage stay the same.
+
+In **Add account**, click **+** beside the service tiles, enter **Service Name** and **Home URL**, then **Save service**. Saved tiles are reusable after restart. Right-click a custom tile to edit it.
 
 Use **+** beside the tab strip to open another tab in the current profile. These tabs share that profile's login storage. Links and scripts that request another window open as tabs in the same profile, including sign-in popups that need their opener. Close tabs with **×**. Open tabs and the selected tab are remembered across restarts.
 
 Use **« / »** at the top of the workspace to collapse or expand the left navigation pane. The browser area resizes immediately and remembers the pane state.
 
+The **⌃ / ⌄** button beside the address bar narrows or expands the top pane. Narrow mode keeps the address/navigation row visible and hides the tab strip and title row. The browser immediately gains the space, and this preference survives restart. Expand to switch or add tabs.
+
 ### Downloads
 
 Open **Workspace settings → Downloads** to choose a download folder and toggle **Ask where to save each download**. These are AccountDeck preferences, independent of Edge's organization-managed preference screen. When enabled, the app opens a Windows Save As dialog for each download. When disabled, files go to the selected folder and duplicate names receive a number. Operating-system permissions and mandatory security policies still apply.
+
+Click **↓** beside the address bar for download progress, bytes received, and completed/interrupted results for this app session. Active downloads also show a percentage in the toolbar when the file size is known.
 
 ### Synchronizing profile tabs
 
@@ -38,15 +46,15 @@ Open **Workspace settings → Downloads** to choose a download folder and toggle
 
 Only selected matching tabs receive actions. Typing supports Unicode, ordinary text fields, and matching contenteditable controls. During sync, links that open another tab do so in the background in each selected profile. Switching the source profile or tab, locking, sleeping, or closing tabs stops sync. Opening a workspace dialog pauses mirroring, and restarting the app leaves sync off.
 
-Clicks and Enter may submit forms in every selected tab. Standard password fields and autocomplete-marked payment/one-time-code fields are excluded. Embedded frames and differing page layouts are not supported; complex site-specific editors may require manual use. Sync actions and typed text are not saved to an action log.
+Clicks and Enter may submit forms in every selected tab. Password fields are excluded by default. Enable **Include password fields** in the sync dialog to mirror password input for that sync session. The option resets when sync stops or the app restarts; typed values are not saved in settings or logs. Autocomplete-marked payment/one-time-code fields remain excluded. Covered, disabled, ambiguous, or different-page targets are skipped with a reason shown by the sync indicator. Embedded frames, drag gestures, and differing page layouts are not supported; complex site-specific editors may require manual use. Sync actions and typed text are not saved to an action log.
 
 ### Persistent sessions
 
 Cookies, local storage, IndexedDB, cache, and browser-managed saved passwords belong to each profile and persist across normal app exits and Windows restarts. Session-only cookies are additionally saved in an encrypted snapshot every 30 seconds and on normal close, then restored before the next navigation. Snapshots use Windows DPAPI under the current Windows user; do not expect copying the data folder to another Windows user or computer to transfer working logins. Do not delete or rename the data folder if you want to keep sessions.
 
-Websites control their own session expiry, sign-outs, two-factor authentication, and embedded-browser login restrictions. AccountDeck cannot prevent a site from requiring authentication again. No passwords are captured by AccountDeck's interface. A sudden power loss or forced process kill can lose changes since the latest snapshot. This app does not automatically launch at Windows sign-in; open it again to resume.
+Websites control their own session expiry, sign-outs, two-factor authentication, and embedded-browser login restrictions. AccountDeck cannot prevent a site from requiring authentication again. The workspace interface does not store website passwords. Opted-in password synchronization holds action values in memory only. A sudden power loss or forced process kill can lose changes since the latest snapshot. This app does not automatically launch at Windows sign-in; open it again to resume.
 
-Available without activation: multiple persistent accounts and tabs, custom home URLs, groups, pinning, ordering, independent duplicate accounts, per-account audio mute, notification pause, sleep/resume, navigation, zoom, configurable downloads, selected-tab action sync, a collapsible sidebar, dark/light themes, metadata import/export, developer tools, and an Argon2 workspace password lock. Location/camera/microphone requests use the browser's normal permission prompts. Notification delivery also depends on Windows and website support.
+Available without activation: multiple persistent accounts and tabs, custom home URLs, groups, pinning, ordering, independent duplicate accounts, per-account audio mute, notification pause, sleep/resume, navigation, zoom, configurable downloads, selected-tab action sync, custom profile abbreviations, drag ordering, saved service tiles, compact top controls, a collapsible sidebar, dark/light themes, metadata import/export, developer tools, and an Argon2 workspace password lock. Location/camera/microphone requests use the browser's normal permission prompts. Notification delivery also depends on Windows and website support.
 
 The optional blocker covers a bundled set of common advertising/tracking hostnames. It is a basic domain blocker, not an equivalent of the original application's full filter-list engine. Turn it off for a site that stops working.
 
@@ -58,7 +66,7 @@ Keyboard shortcuts work when workspace controls have focus: Ctrl+T new tab, Ctrl
 
 ## Updating
 
-Close the existing app, replace the executable, and keep the existing `AccountDeck-data` folder. Version 0.2.0 reads older settings and preserves existing profile storage while adding defaults for the new preferences.
+Close the existing app, replace the executable, and keep the existing `AccountDeck-data` folder. Version 0.3.0 reads older settings and preserves existing profile storage while adding defaults for the new preferences.
 
 ## Build and verify
 

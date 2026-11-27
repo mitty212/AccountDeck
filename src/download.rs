@@ -2,6 +2,43 @@ use std::{
     fs::{self, OpenOptions},
     path::{Path, PathBuf},
 };
+#[derive(Clone, serde::Serialize)]
+pub struct Record {
+    pub id: String,
+    pub name: String,
+    pub received: u64,
+    pub total: Option<u64>,
+    pub status: String,
+}
+
+pub fn report(
+    operation: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2DownloadOperation,
+    id: &str,
+    proxy: &tao::event_loop::EventLoopProxy<crate::AppEvent>,
+) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::*;
+    unsafe {
+        let mut received = 0;
+        let mut total = 0;
+        let mut state = COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS;
+        let _ = operation.BytesReceived(&mut received);
+        let _ = operation.TotalBytesToReceive(&mut total);
+        let _ = operation.State(&mut state);
+        let status = if state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED {
+            "complete"
+        } else if state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED {
+            "interrupted"
+        } else {
+            "downloading"
+        };
+        let _ = proxy.send_event(crate::AppEvent::DownloadProgress {
+            id: id.into(),
+            received: received.max(0) as u64,
+            total: if total > 0 { Some(total as u64) } else { None },
+            status: status.into(),
+        });
+    }
+}
 
 pub fn default_directory() -> PathBuf {
     directories::UserDirs::new()

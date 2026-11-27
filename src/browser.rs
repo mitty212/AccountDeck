@@ -15,9 +15,10 @@ use tao::{
     window::Window,
 };
 use webview2_com::{
-    DownloadStartingEventHandler, Microsoft::Web::WebView2::Win32::*,
-    NewWindowRequestedEventHandler, NotificationReceivedEventHandler,
-    WebResourceRequestedEventHandler, WindowCloseRequestedEventHandler, take_pwstr,
+    BytesReceivedChangedEventHandler, DownloadStartingEventHandler,
+    Microsoft::Web::WebView2::Win32::*, NewWindowRequestedEventHandler,
+    NotificationReceivedEventHandler, StateChangedEventHandler, WebResourceRequestedEventHandler,
+    WindowCloseRequestedEventHandler, take_pwstr,
 };
 use windows::{
     Win32::System::Com::IStream,
@@ -73,6 +74,7 @@ impl Browser {
         url: &str,
         proxy: EventLoopProxy<AppEvent>,
         width: f64,
+        top: f64,
         environment: Option<ICoreWebView2Environment>,
     ) -> Result<String, String> {
         let env = environment.unwrap_or_else(|| self.active().view.environment());
@@ -88,6 +90,7 @@ impl Browser {
             self.notifications.clone(),
             proxy,
             width,
+            top,
         )?;
         if url != "about:blank" {
             tab.view.load_url(url).map_err(|e| e.to_string())?;
@@ -97,11 +100,11 @@ impl Browser {
         Ok(id)
     }
 }
-pub fn bounds(window: &Window, width: f64) -> Rect {
+pub fn bounds(window: &Window, width: f64, top: f64) -> Rect {
     let s = window.inner_size().to_logical::<f64>(window.scale_factor());
     Rect {
-        position: LogicalPosition::new(width, 128.).into(),
-        size: LogicalSize::new((s.width - width).max(1.), (s.height - 128.).max(1.)).into(),
+        position: LogicalPosition::new(width, top).into(),
+        size: LogicalSize::new((s.width - width).max(1.), (s.height - top).max(1.)).into(),
     }
 }
 fn build_tab(
@@ -115,6 +118,7 @@ fn build_tab(
     notifications: Arc<AtomicBool>,
     proxy: EventLoopProxy<AppEvent>,
     width: f64,
+    top: f64,
 ) -> Result<Tab, String> {
     let notices = notifications.clone();
     let p = proxy.clone();
@@ -135,7 +139,7 @@ fn build_tab(
     }
     // This bridge handles only authenticated input-sync packets; it cannot execute application commands.
     let view = builder
-        .with_bounds(bounds(window, width))
+        .with_bounds(bounds(window, width, top))
         .with_visible(false)
         .with_focused(false)
         .with_url("about:blank")
@@ -206,6 +210,7 @@ pub fn create(
     saved: &[SavedTab],
     active: Option<&str>,
     width: f64,
+    top: f64,
 ) -> Result<Browser, String> {
     std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
     let mut context = WebContext::new(Some(directory.join("webview")));
@@ -226,6 +231,7 @@ pub fn create(
         notifications.clone(),
         proxy.clone(),
         width,
+        top,
     )?;
     let snapshot = directory.join("session.dpapi");
     if crate::session::restore(&tab.view, &snapshot).is_err() {
@@ -256,6 +262,7 @@ pub fn create(
             browser.notifications.clone(),
             proxy.clone(),
             width,
+            top,
         )?;
         tab.view.load_url(&item.url).map_err(|e| e.to_string())?;
         browser.tabs.push(tab);
@@ -385,9 +392,35 @@ pub fn install_hooks(
                 &DownloadStartingEventHandler::create(Box::new(move |_, args| {
                     if let Some(args) = args {
                         args.SetHandled(true)?;
+                        let id = uuid::Uuid::new_v4().to_string();
+                        let operation = args.DownloadOperation()?;
+                        let mut event_token = 0;
+                        let bytes_id = id.clone();
+                        let bytes_proxy = download_proxy.clone();
+                        operation.add_BytesReceivedChanged(
+                            &BytesReceivedChangedEventHandler::create(Box::new(move |op, _| {
+                                if let Some(op) = op {
+                                    crate::download::report(&op, &bytes_id, &bytes_proxy);
+                                }
+                                Ok(())
+                            })),
+                            &mut event_token,
+                        )?;
+                        let state_id = id.clone();
+                        let state_proxy = download_proxy.clone();
+                        operation.add_StateChanged(
+                            &StateChangedEventHandler::create(Box::new(move |op, _| {
+                                if let Some(op) = op {
+                                    crate::download::report(&op, &state_id, &state_proxy);
+                                }
+                                Ok(())
+                            })),
+                            &mut event_token,
+                        )?;
                         let deferral = args.GetDeferral()?;
                         if download_proxy
                             .send_event(AppEvent::Download {
+                                id,
                                 args: args.clone(),
                                 deferral: deferral.clone(),
                             })

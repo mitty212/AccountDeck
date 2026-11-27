@@ -24,6 +24,9 @@ pub struct Target {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Action {
+    Ready {
+        enabled: bool,
+    },
     Move {
         target: Target,
         modifiers: u8,
@@ -65,6 +68,7 @@ pub struct Packet {
 pub struct Selection {
     pub source: Option<String>,
     pub targets: Vec<String>,
+    pub include_passwords: bool,
 }
 pub fn page_key(raw: &str) -> Option<String> {
     let u = url::Url::parse(raw).ok()?;
@@ -81,12 +85,13 @@ pub fn same_origin(a: &str, b: &str) -> bool {
 }
 pub fn valid(action: &Action) -> bool {
     match action {
+        Action::Ready { .. } => true,
         Action::Move { target, modifiers }
         | Action::Click {
             target, modifiers, ..
         } => {
             !target.selector.is_empty()
-                && target.selector.len() <= 2048
+                && target.selector.len() <= 8192
                 && target.rx.is_finite()
                 && target.ry.is_finite()
                 && (0.0..=1.0).contains(&target.rx)
@@ -97,10 +102,10 @@ pub fn valid(action: &Action) -> bool {
             selector, value, ..
         }
         | Action::Change { selector, value } => {
-            !selector.is_empty() && selector.len() <= 2048 && value.len() <= 65536
+            !selector.is_empty() && selector.len() <= 8192 && value.len() <= 65536
         }
         Action::Scroll { selector, x, y, .. } => {
-            selector.len() <= 2048
+            selector.len() <= 8192
                 && x.is_finite()
                 && y.is_finite()
                 && x.abs() < 100_000_000.
@@ -112,7 +117,7 @@ pub fn valid(action: &Action) -> bool {
             code,
             modifiers,
         } => {
-            selector.len() <= 2048
+            selector.len() <= 8192
                 && code.len() < 32
                 && *modifiers <= 15
                 && matches!(
@@ -135,13 +140,22 @@ pub fn valid(action: &Action) -> bool {
 pub fn capture_script(token: &str) -> String {
     include_str!("sync_capture.js").replace("__TOKEN__", &serde_json::to_string(token).unwrap())
 }
-pub fn configure(view: &WebView, source: bool) {
-    let _ = view.evaluate_script(&format!("window.__accountdeckSync?.configure({source})"));
+pub fn configure(view: &WebView, source: bool, passwords: bool) {
+    let _ = view.evaluate_script(&format!(
+        "window.__accountdeckSync?.configure({source},{passwords})"
+    ));
 }
-
+type Done = Rc<dyn Fn(Result<(), String>)>;
+struct Pending {
+    action: Action,
+    generation: u64,
+    page: String,
+    passwords: bool,
+    report: Done,
+}
 #[derive(Clone, Default)]
 pub struct Queue {
-    pending: Rc<RefCell<VecDeque<(Action, u64, String)>>>,
+    pending: Rc<RefCell<VecDeque<Pending>>>,
     busy: Rc<Cell<bool>>,
 }
 fn pump(core: ICoreWebView2, queue: Queue, epoch: Arc<AtomicU64>) {
@@ -149,23 +163,33 @@ fn pump(core: ICoreWebView2, queue: Queue, epoch: Arc<AtomicU64>) {
         return;
     }
     loop {
-        let Some((action, expected, page)) = queue.pending.borrow_mut().pop_front() else {
+        let Some(p) = queue.pending.borrow_mut().pop_front() else {
             return;
         };
-        if expected != epoch.load(Ordering::Relaxed) {
+        if p.generation != epoch.load(Ordering::Relaxed) {
             continue;
         }
         queue.busy.set(true);
-        let q = queue.clone();
-        let c = core.clone();
-        let e = epoch.clone();
-        let done: Rc<dyn Fn()> = Rc::new(move || {
+        let (q, c, e) = (queue.clone(), core.clone(), epoch.clone());
+        let completed = Cell::new(false);
+        let done: Done = Rc::new(move |result| {
+            if completed.replace(true) {
+                return;
+            }
+            (p.report)(result);
             q.busy.set(false);
             pump(c.clone(), q.clone(), e.clone());
         });
-        if execute(core.clone(), action, epoch, expected, done.clone(), page).is_err() {
-            done();
-        }
+        execute(
+            core,
+            p.action,
+            epoch,
+            p.generation,
+            done,
+            p.page,
+            p.passwords,
+            false,
+        );
         return;
     }
 }
@@ -176,39 +200,81 @@ pub fn replay(
     epoch: Arc<AtomicU64>,
     expected: u64,
     page: String,
+    passwords: bool,
+    report: Done,
 ) -> Result<(), String> {
-    if !valid(&action) {
+    if !valid(&action) || matches!(action, Action::Ready { .. }) {
         return Err("Invalid synchronized action.".into());
     }
-    // Keep actions in order so rapid typing cannot race selection/replacement.
     {
         let mut pending = queue.pending.borrow_mut();
-        let coalesce = match (pending.back(), &action) {
-            (Some((Action::Move { .. }, generation, _)), Action::Move { .. }) => {
-                *generation == expected
-            }
-            (
-                Some((
-                    Action::Input {
-                        selector: previous, ..
-                    },
-                    generation,
-                    _,
-                )),
-                Action::Input { selector, .. },
-            ) => *generation == expected && previous == selector,
-            _ => false,
-        };
+        let coalesce = pending.back().is_some_and(|p| {
+            p.generation == expected
+                && match (&p.action, &action) {
+                    (Action::Move { .. }, Action::Move { .. }) => true,
+                    (Action::Input { selector: a, .. }, Action::Input { selector: b, .. }) => {
+                        a == b
+                    }
+                    _ => false,
+                }
+        });
         if coalesce {
             pending.pop_back();
         }
         if pending.len() >= 512 {
             return Err("Synchronized input queue is full.".into());
         }
-        pending.push_back((action, expected, page));
+        pending.push_back(Pending {
+            action,
+            generation: expected,
+            page,
+            passwords,
+            report,
+        });
     }
     pump(view.webview(), queue, epoch);
     Ok(())
+}
+// Never return protocol payloads in errors: input commands can contain credentials.
+fn cdp(
+    core: ICoreWebView2,
+    method: &str,
+    params: Value,
+    callback: impl FnOnce(Result<Value, String>) + 'static,
+) {
+    let once = Rc::new(RefCell::new(Some(callback)));
+    let completed = once.clone();
+    let handler =
+        CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |status, response| {
+            if let Some(callback) = completed.borrow_mut().take() {
+                let parsed = serde_json::from_str::<Value>(&response).ok();
+                callback(
+                    if status.is_err() || parsed.as_ref().is_none_or(|v| v.get("error").is_some()) {
+                        Err("Browser could not apply this action.".into())
+                    } else {
+                        Ok(parsed.unwrap())
+                    },
+                );
+            }
+            Ok(())
+        }));
+    let result = unsafe {
+        core.CallDevToolsProtocolMethod(
+            &HSTRING::from(method),
+            &HSTRING::from(params.to_string()),
+            &handler,
+        )
+    };
+    if result.is_err() {
+        if let Some(callback) = once.borrow_mut().take() {
+            callback(Err("Browser could not apply this action.".into()));
+        }
+    }
+}
+fn matches_page(core: &ICoreWebView2, page: &str) -> bool {
+    let mut url = windows::core::PWSTR::null();
+    unsafe { core.Source(&mut url) }.is_ok()
+        && page_key(&webview2_com::take_pwstr(url)).as_deref() == Some(page)
 }
 fn call(
     core: ICoreWebView2,
@@ -216,174 +282,143 @@ fn call(
     index: usize,
     epoch: Arc<AtomicU64>,
     expected: u64,
-    done: Rc<dyn Fn()>,
+    done: Done,
     page: Arc<String>,
 ) {
-    if epoch.load(Ordering::Relaxed) != expected || index >= steps.len() {
-        done();
+    if index >= steps.len() {
+        done(Ok(()));
         return;
     }
-    let mut url = windows::core::PWSTR::null();
-    let matches = unsafe { core.Source(&mut url) }.is_ok()
-        && page_key(&webview2_com::take_pwstr(url)).as_ref() == Some(page.as_ref());
-    if !matches {
-        done();
+    let (method, params) = steps[index].clone();
+    // Always release an already pressed mouse/key even if its handler navigates or sync stops.
+    let release = matches!(params["type"].as_str(), Some("mouseReleased" | "keyUp"));
+    if !release && (epoch.load(Ordering::Relaxed) != expected || !matches_page(&core, &page)) {
+        done(Err(
+            "Target page changed before this action finished.".into()
+        ));
         return;
     }
     let next = core.clone();
-    let rest = steps.clone();
-    let guard = epoch.clone();
-    let next_done = done.clone();
-    let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |status, _| {
-        if status.is_ok() {
-            call(
-                next,
-                rest,
-                index + 1,
-                guard,
-                expected,
-                next_done.clone(),
-                page,
-            );
-        } else {
-            next_done();
+    cdp(core, &method, params, move |result| match result {
+        Ok(_) => call(next, steps, index + 1, epoch, expected, done, page),
+        Err(error) => {
+            // A failed press may still have reached Chromium. Best effort release keeps its input state usable.
+            if steps
+                .get(index + 1)
+                .is_some_and(|(_, v)| matches!(v["type"].as_str(), Some("mouseReleased" | "keyUp")))
+            {
+                let (method, params) = &steps[index + 1];
+                let end = done.clone();
+                cdp(next, method, params.clone(), move |_| end(Err(error)));
+            } else {
+                done(Err(error));
+            }
         }
-        Ok(())
-    }));
-    unsafe {
-        if core
-            .CallDevToolsProtocolMethod(
-                &HSTRING::from(&steps[index].0),
-                &HSTRING::from(steps[index].1.to_string()),
-                &handler,
-            )
-            .is_err()
-        {
-            done();
-        }
-    }
+    });
 }
-/// Prepare the matching DOM element, then dispatch real Chromium input to it.
-/// The shared epoch cancels queued commands as soon as the user stops sync.
+/// Resolve matching controls, hit test after hover, and dispatch trusted Chromium input.
 fn execute(
     core: ICoreWebView2,
     action: Action,
     epoch: Arc<AtomicU64>,
     expected: u64,
-    done: Rc<dyn Fn()>,
+    done: Done,
     page: String,
-) -> Result<(), String> {
-    if !valid(&action) {
-        return Err("Invalid synchronized action.".into());
+    passwords: bool,
+    hovered: bool,
+) {
+    if epoch.load(Ordering::Relaxed) != expected {
+        done(Err("Sync session stopped.".into()));
+        return;
     }
-    let payload = serde_json::to_string(&action).map_err(|e| e.to_string())?;
-    let key = page_key(&page).ok_or("Invalid synchronized page.")?;
-    let expected_key = serde_json::to_string(&key).unwrap();
+    let Some(key) = page_key(&page) else {
+        done(Err("Invalid synchronized page.".into()));
+        return;
+    };
     let expression = format!(
-        r#"(()=>{{
-      if(location.origin+location.pathname!=={expected_key})return null;
-      const a={payload};let el;
-      function find(s){{let options;try{{options=JSON.parse(s);}}catch{{options=[s];}}if(!Array.isArray(options))return null;for(const candidate of options){{try{{const e=document.querySelector(candidate);if(e)return e;}}catch{{}}}}return null;}}
-      try{{el=a.kind==='move'||a.kind==='click'?find(a.target.selector):a.selector?find(a.selector):document.documentElement;}}catch{{return null;}}
-      if(!el||el.closest('input[type=password],[autocomplete^="cc-"],[autocomplete="one-time-code"]'))return null;
-      if(a.kind==='move'||a.kind==='click'){{const r=el.getBoundingClientRect();const x=r.left+r.width*a.target.rx,y=r.top+r.height*a.target.ry;if(x<0||y<0||x>=innerWidth||y>=innerHeight)return null;return {{x,y}};}}
-      if(a.kind==='scroll'){{if(a.window)window.scrollTo(a.x,a.y);else el.scrollTo(a.x,a.y);return {{done:true}};}}
-      if(a.kind==='change'){{if(!(el instanceof HTMLSelectElement))return null;el.value=a.value;el.dispatchEvent(new Event('input',{{bubbles:true}}));el.dispatchEvent(new Event('change',{{bubbles:true}}));return {{done:true}};}}
-      el.focus({{preventScroll:true}});
-      if(a.kind==='input'){{
-        if(a.editable){{if(!el.isContentEditable)return null;const r=document.createRange();r.selectNodeContents(el);const s=getSelection();s.removeAllRanges();s.addRange(r);}}
-        else{{if(!(el instanceof HTMLInputElement||el instanceof HTMLTextAreaElement))return null;
-          if(el instanceof HTMLInputElement&&!['text','search','email','url','tel','number','range'].includes(el.type))return null;
-          try{{el.setSelectionRange(0,el.value.length);}}catch{{const prototype=el instanceof HTMLTextAreaElement?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;Object.getOwnPropertyDescriptor(prototype,'value').set.call(el,a.value);el.dispatchEvent(new InputEvent('input',{{bubbles:true,inputType:'insertReplacementText',data:a.value}}));return {{done:true}};}}
-        }}
-      }}
-      return {{ready:true}};
-    }})()"#
+        "{}({},{},{})",
+        include_str!("sync_resolve.js"),
+        serde_json::to_string(&action).unwrap(),
+        serde_json::to_string(&key).unwrap(),
+        passwords
     );
     let next = core.clone();
-    let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
-        move |status, response| {
-            if status.is_err() || epoch.load(Ordering::Relaxed) != expected {
-                done();
-                return Ok(());
+    cdp(
+        core,
+        "Runtime.evaluate",
+        json!({"expression":expression,"returnByValue":true}),
+        move |response| {
+            let response = match response {
+                Ok(v) => v,
+                Err(e) => {
+                    done(Err(e));
+                    return;
+                }
+            };
+            if epoch.load(Ordering::Relaxed) != expected {
+                done(Err("Sync session stopped.".into()));
+                return;
             }
-            let raw = response;
-            let value: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-            let p = &value["result"]["value"];
-            if p.is_null() || p["done"] == true {
-                done();
-                return Ok(());
+            let p = &response["result"]["value"];
+            if let Some(error) = p["error"].as_str() {
+                done(Err(error.into()));
+                return;
+            }
+            if p.is_null() || response.get("exceptionDetails").is_some() {
+                done(Err("Matching control could not be prepared.".into()));
+                return;
+            }
+            if p["done"] == true {
+                done(Ok(()));
+                return;
+            }
+            if let Action::Click { modifiers, .. } = &action {
+                if !hovered {
+                    let end = done.clone();
+                    let again = next.clone();
+                    let modifiers = *modifiers;
+                    cdp(
+                        next,
+                        "Input.dispatchMouseEvent",
+                        json!({"type":"mouseMoved","x":p["x"],"y":p["y"],"buttons":0,"modifiers":modifiers}),
+                        move |r| match r {
+                            Ok(_) => {
+                                execute(again, action, epoch, expected, end, page, passwords, true)
+                            }
+                            Err(e) => end(Err(e)),
+                        },
+                    );
+                    return;
+                }
             }
             let mut steps = Vec::<(String, Value)>::new();
             match action {
-                Action::Move { modifiers, .. } => {
-                    steps.push((
-                        "Input.dispatchMouseEvent".into(),
-                        json!({"type":"mouseMoved","x":p["x"],"y":p["y"],"modifiers":modifiers}),
-                    ));
-                }
-                Action::Click {
-                    modifiers, count, ..
-                } => {
-                    for kind in ["mouseMoved", "mousePressed", "mouseReleased"] {
-                        steps.push(("Input.dispatchMouseEvent".into(),json!({"type":kind,"x":p["x"],"y":p["y"],"button":"left","clickCount":count.clamp(1,2),"modifiers":modifiers})));
-                    }
-                }
-                Action::Input { value, .. } => {
-                    if value.is_empty() {
-                        for kind in ["rawKeyDown", "keyUp"] {
-                            steps.push(("Input.dispatchKeyEvent".into(),json!({"type":kind,"key":"Backspace","code":"Backspace","windowsVirtualKeyCode":8})));
-                        }
-                    } else {
-                        steps.push(("Input.insertText".into(), json!({"text":value})));
-                    }
-                }
-                Action::Key {
-                    key,
-                    code,
-                    modifiers,
-                    ..
-                } => {
-                    let vk = match key.as_str() {
-                        "Enter" => 13,
-                        "Tab" => 9,
-                        "Escape" => 27,
-                        "ArrowLeft" => 37,
-                        "ArrowUp" => 38,
-                        "ArrowRight" => 39,
-                        "ArrowDown" => 40,
-                        "Home" => 36,
-                        "End" => 35,
-                        "PageUp" => 33,
-                        "PageDown" => 34,
-                        _ => 0,
-                    };
-                    for kind in ["rawKeyDown", "keyUp"] {
-                        steps.push(("Input.dispatchKeyEvent".into(),json!({"type":kind,"key":key,"code":code,"windowsVirtualKeyCode":vk,"modifiers":modifiers})));
-                    }
-                }
-                _ => {}
-            }
+            Action::Move{modifiers,..}=>steps.push(("Input.dispatchMouseEvent".into(),json!({"type":"mouseMoved","x":p["x"],"y":p["y"],"buttons":0,"modifiers":modifiers}))),
+            Action::Click{modifiers,count,..}=>for (kind,buttons) in [("mousePressed",1),("mouseReleased",0)] {
+                steps.push(("Input.dispatchMouseEvent".into(),json!({"type":kind,"x":p["x"],"y":p["y"],"button":"left","buttons":buttons,"clickCount":count.clamp(1,2),"modifiers":modifiers})));
+            },
+            Action::Input{value,..}=>{
+                if p["select_all"]==true {for kind in ["rawKeyDown","keyUp"] {steps.push(("Input.dispatchKeyEvent".into(),json!({"type":kind,"key":"a","code":"KeyA","windowsVirtualKeyCode":65,"modifiers":2})));}}
+                if value.is_empty(){for kind in ["rawKeyDown","keyUp"]{steps.push(("Input.dispatchKeyEvent".into(),json!({"type":kind,"key":"Backspace","code":"Backspace","windowsVirtualKeyCode":8})));}}
+                else {steps.push(("Input.insertText".into(),json!({"text":value})));}
+            },
+            Action::Key{key,code,modifiers,..}=>{
+                let vk=match key.as_str(){"Enter"=>13,"Tab"=>9,"Escape"=>27,"ArrowLeft"=>37,"ArrowUp"=>38,"ArrowRight"=>39,"ArrowDown"=>40,"Home"=>36,"End"=>35,"PageUp"=>33,"PageDown"=>34,_=>0};
+                for kind in ["rawKeyDown","keyUp"]{steps.push(("Input.dispatchKeyEvent".into(),json!({"type":kind,"key":key,"code":code,"windowsVirtualKeyCode":vk,"modifiers":modifiers})));}
+            },
+            _=>{},
+        }
             call(
                 next,
                 Arc::new(steps),
                 0,
                 epoch,
                 expected,
-                done.clone(),
+                done,
                 Arc::new(key),
             );
-            Ok(())
         },
-    ));
-    unsafe {
-        core.CallDevToolsProtocolMethod(
-            &HSTRING::from("Runtime.evaluate"),
-            &HSTRING::from(json!({"expression":expression,"returnByValue":true}).to_string()),
-            &handler,
-        )
-        .map_err(|e| e.to_string())
-    }
+    );
 }
 #[cfg(test)]
 mod tests {
